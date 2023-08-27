@@ -9,8 +9,23 @@ use axum::{
 use http::{StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::process::Command;
+use std::{collections::HashMap, sync::Mutex};
+
+use once_cell::sync::Lazy;
+
+static MODELS: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| {
+    let mut map = HashMap::new();
+    map.insert(
+        String::from("meta-llama/Llama-2-7b-hf"),
+        String::from("https://huggingface.co/meta-llama/Llama-2-7b-hf"),
+    );
+    map.insert(
+        String::from("meta-llama/Llama-2-7b-chat-hf"),
+        String::from("https://huggingface.co/meta-llama/Llama-2-7b-chat-hf"),
+    );
+    Mutex::new(map)
+});
 
 // We've already seen returning &'static str
 async fn plain_text() -> &'static str {
@@ -100,16 +115,30 @@ async fn query(Query(params): Query<HashMap<String, String>>) -> String {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ModelInfo {
-    name: String,
-    quant_info: String,
+    pub(crate) name: String,
+    pub(crate) quant_info: String,
 }
 
 // json request
-async fn json_request(Json(model): Json<ModelInfo>) -> String {
-    println!("{:?}", model);
+async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
+    println!("{:?}", &model_info);
 
-    // download ggml
-    download_ggml().await.unwrap();
+    // download and build llama.cpp
+    let llama_cpp_dir = download_and_build_llama_cpp().await.unwrap();
+
+    // download llama2 models
+    let model_repo_dir = download_llama2_models(&model_info).await.unwrap();
+
+    // convert the target model to ggml
+    let out_filename = format!(
+        "{}.{}",
+        model_info.name.as_str().split('/').collect::<Vec<&str>>()[1],
+        "bin"
+    );
+    let outfile = std::path::Path::new(out_filename.as_str());
+    convert_to_ggml(llama_cpp_dir.as_path(), model_repo_dir.as_path(), outfile)
+        .await
+        .unwrap();
 
     "download_url".to_string()
 }
@@ -117,43 +146,130 @@ async fn json_request(Json(model): Json<ModelInfo>) -> String {
 // From https://github.com/ggerganov/llama.cpp/tags
 const CODE_BASE: &str = "d2a4366";
 
-async fn download_ggml() -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!(
-        "https://github.com/ggerganov/llama.cpp/archive/refs/tags/master-{CODE_BASE}.tar.gz"
-    );
+async fn download_and_build_llama_cpp() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let llama_cpp_dir = std::env::current_dir()?.join("llama.cpp");
 
-    let status = Command::new("wget").arg(&url).status()?;
-    println!("status: {:?}", status);
+    if !llama_cpp_dir.exists() {
+        let url = format!(
+            "https://github.com/ggerganov/llama.cpp/archive/refs/tags/master-{CODE_BASE}.tar.gz"
+        );
 
-    let status = Command::new("tar")
-        .arg("-zxvf")
-        .arg("master-d2a4366.tar.gz")
-        .status();
-    println!("status: {:?}", status);
+        let status = Command::new("wget").arg(&url).status()?;
+        println!("status: {:?}", status);
 
-    let status = Command::new("rm")
-        .arg("-rf")
-        .arg(format!("master-{CODE_BASE}.tar.gz").as_str())
-        .status();
-    println!("status: {:?}", status);
+        let status = Command::new("tar")
+            .arg("-zxvf")
+            .arg("master-d2a4366.tar.gz")
+            .status();
+        println!("status: {:?}", status);
 
-    let status = Command::new("mv")
-        .arg(format!("llama.cpp-master-{CODE_BASE}").as_str())
-        .arg("llama.cpp")
-        .status();
-    println!("status: {:?}", status);
+        let status = Command::new("rm")
+            .arg("-rf")
+            .arg(format!("master-{CODE_BASE}.tar.gz").as_str())
+            .status();
+        println!("status: {:?}", status);
 
-    if std::path::Path::new("llama.cpp").exists() {
+        let status = Command::new("mv")
+            .arg(format!("llama.cpp-master-{CODE_BASE}").as_str())
+            .arg("llama.cpp")
+            .status();
+        println!("status: {:?}", status);
+
+        if !std::path::Path::new("llama.cpp").exists() {
+            panic!("Not found llama.cpp directory");
+        }
+    } else {
+        println!("llama.cpp directory already exists");
+    }
+
+    let quantizer = llama_cpp_dir.join("quantize");
+    if quantizer.exists() && quantizer.is_file() {
+        println!("Already build llama.cpp");
+    } else if quantizer.exists() && quantizer.is_file() {
+        println!("Already build llama.cpp");
+    } else {
+        // build llama.cpp
         let curr_dir = std::env::current_dir()?;
         let llama_cpp_dir = curr_dir.join("llama.cpp");
         std::env::set_current_dir(llama_cpp_dir)?;
         let status = Command::new("make").arg("-j").status();
         println!("status: {:?}", status);
 
+        // check if the build process is successful
         let status = Command::new("./quantize").arg("--help").status()?;
         println!("status: {:?}", status);
+    }
+
+    Ok(llama_cpp_dir)
+}
+
+async fn download_llama2_models(
+    model_info: &ModelInfo,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let mut success = false;
+    let mut retries = 0;
+
+    let model_repo_dir =
+        std::path::PathBuf::from(model_info.name.as_str().split('/').collect::<Vec<&str>>()[1]);
+    if model_repo_dir.exists() {
+        println!("Model '{}' already exists", model_info.name);
     } else {
-        println!("Not found llama.cpp");
+        let locked = MODELS.lock().unwrap();
+        let url = locked.get(model_info.name.as_str()).ok_or(format!(
+            "Failed to get the url of the model '{}'",
+            model_info.name
+        ))?;
+        // println!("url: {url}");
+
+        println!("Downloading from {url}...");
+
+        while !success && retries < 3 {
+            println!("({retries}) Git clone llama2 models...");
+
+            let output = Command::new("git").arg("clone").arg(url).output();
+
+            match output {
+                Ok(output) if output.status.success() => {
+                    success = true;
+                    println!("Git clone succeeded!");
+                }
+                _ => {
+                    retries += 1;
+                    println!("output: {:?}", output);
+                    println!("Git clone failed, retry again...");
+                }
+            }
+        }
+
+        if !success {
+            println!("Git clone failed after 3 retries.");
+        }
+    }
+
+    Ok(model_repo_dir)
+}
+
+async fn convert_to_ggml(
+    llama_cpp_dir: &std::path::Path,
+    model_repo_dir: &std::path::Path,
+    outfile: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let converter = llama_cpp_dir.join("convert.py");
+    println!("converter: {:?}", converter.as_path());
+
+    println!("out_file: {:?}", outfile);
+
+    if converter.exists() && converter.is_file() {
+        let output = Command::new("python3")
+            .arg(converter)
+            .arg(model_repo_dir)
+            .arg("--outfile")
+            .arg(outfile)
+            .output()?;
+
+        println!("output: {:?}", output);
+    } else {
+        panic!("Not found converter.py");
     }
 
     Ok(())
