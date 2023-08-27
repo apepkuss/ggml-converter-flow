@@ -10,7 +10,7 @@ struct ModelInfo {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let model_info = ModelInfo {
-        name: "llama-2-7B".to_string(),
+        name: "meta-llama/Llama-2-7b-hf".to_string(),
         quant_info: "q4_0".to_string(),
     };
 
