@@ -10,7 +10,7 @@ use http::{StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::Command;
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex, time::Instant};
 
 use once_cell::sync::Lazy;
 
@@ -125,20 +125,49 @@ async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
 
     // download and build llama.cpp
     let llama_cpp_dir = download_and_build_llama_cpp().await.unwrap();
+    dbg!(&llama_cpp_dir);
 
     // download llama2 models
     let model_repo_dir = download_llama2_models(&model_info).await.unwrap();
+    dbg!(&model_repo_dir);
 
     // convert the target model to ggml
+    let curr_dir = std::env::current_dir().unwrap();
+    let root_dir = curr_dir.parent().unwrap();
+    let outputs_dir = root_dir.join("outputs");
+    if !outputs_dir.exists() {
+        std::fs::create_dir(outputs_dir.as_path()).unwrap();
+    }
     let out_filename = format!(
-        "{}.{}",
+        "{}-ggml.{}",
         model_info.name.as_str().split('/').collect::<Vec<&str>>()[1],
         "bin"
     );
-    let outfile = std::path::Path::new(out_filename.as_str());
-    convert_to_ggml(llama_cpp_dir.as_path(), model_repo_dir.as_path(), outfile)
-        .await
-        .unwrap();
+    let outfile = outputs_dir.join(out_filename.as_str());
+    convert_to_ggml(
+        llama_cpp_dir.as_path(),
+        model_repo_dir.as_path(),
+        outfile.as_path(),
+    )
+    .await
+    .unwrap();
+
+    // quantize the ggml model
+    let quantized_filename = format!(
+        "{}-ggml-{}.{}",
+        model_info.name.as_str().split('/').collect::<Vec<&str>>()[1],
+        model_info.quant_info,
+        "bin"
+    );
+    let quantized_outfile = outputs_dir.join(quantized_filename.as_str());
+    quantize_ggml(
+        llama_cpp_dir.as_path(),
+        outfile.as_path(),
+        model_info.quant_info.as_str(),
+        quantized_outfile.as_path(),
+    )
+    .await
+    .unwrap();
 
     "download_url".to_string()
 }
@@ -147,8 +176,10 @@ async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
 const CODE_BASE: &str = "d2a4366";
 
 async fn download_and_build_llama_cpp() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let llama_cpp_dir = std::env::current_dir()?.join("llama.cpp");
+    let curr_dir = std::env::current_dir()?;
+    let llama_cpp_dir = curr_dir.parent().unwrap().join("llama.cpp");
 
+    // download
     if !llama_cpp_dir.exists() {
         let url = format!(
             "https://github.com/ggerganov/llama.cpp/archive/refs/tags/master-{CODE_BASE}.tar.gz"
@@ -182,22 +213,22 @@ async fn download_and_build_llama_cpp() -> Result<std::path::PathBuf, Box<dyn st
         println!("llama.cpp directory already exists");
     }
 
+    // build
     let quantizer = llama_cpp_dir.join("quantize");
     if quantizer.exists() && quantizer.is_file() {
         println!("Already build llama.cpp");
-    } else if quantizer.exists() && quantizer.is_file() {
-        println!("Already build llama.cpp");
     } else {
+        std::env::set_current_dir(llama_cpp_dir.as_path())?;
+
         // build llama.cpp
-        let curr_dir = std::env::current_dir()?;
-        let llama_cpp_dir = curr_dir.join("llama.cpp");
-        std::env::set_current_dir(llama_cpp_dir)?;
         let status = Command::new("make").arg("-j").status();
         println!("status: {:?}", status);
 
         // check if the build process is successful
         let status = Command::new("./quantize").arg("--help").status()?;
         println!("status: {:?}", status);
+
+        std::env::set_current_dir(curr_dir.as_path())?;
     }
 
     Ok(llama_cpp_dir)
@@ -209,8 +240,14 @@ async fn download_llama2_models(
     let mut success = false;
     let mut retries = 0;
 
+    let curr_dir = std::env::current_dir()?;
+    let models_dir = curr_dir.parent().unwrap().join("models");
+    if !models_dir.exists() {
+        std::fs::create_dir(models_dir.as_path())?;
+    }
+
     let model_repo_dir =
-        std::path::PathBuf::from(model_info.name.as_str().split('/').collect::<Vec<&str>>()[1]);
+        models_dir.join(model_info.name.as_str().split('/').collect::<Vec<&str>>()[1]);
     if model_repo_dir.exists() {
         println!("Model '{}' already exists", model_info.name);
     } else {
@@ -219,7 +256,6 @@ async fn download_llama2_models(
             "Failed to get the url of the model '{}'",
             model_info.name
         ))?;
-        // println!("url: {url}");
 
         println!("Downloading from {url}...");
 
@@ -258,18 +294,64 @@ async fn convert_to_ggml(
     println!("converter: {:?}", converter.as_path());
 
     println!("out_file: {:?}", outfile);
+    if outfile.exists() {
+        std::fs::remove_file(outfile)?;
+    }
 
     if converter.exists() && converter.is_file() {
+        println!(
+            "================ Start to convert {} to ggml...",
+            model_repo_dir.file_name().unwrap().to_str().unwrap()
+        );
+
+        let start = Instant::now();
         let output = Command::new("python3")
             .arg(converter)
             .arg(model_repo_dir)
             .arg("--outfile")
             .arg(outfile)
             .output()?;
-
+        let elapsed = Instant::now() - start;
+        println!("The conversion took {:?} seconds.", elapsed.as_secs());
         println!("output: {:?}", output);
     } else {
         panic!("Not found converter.py");
+    }
+
+    Ok(())
+}
+
+async fn quantize_ggml(
+    llama_cpp_dir: &std::path::Path,
+    model: &std::path::Path,
+    quant_info: &str,
+    outfile: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let quantizer = llama_cpp_dir.join("quantize");
+    println!("quantizer: {:?}", quantizer.as_path());
+
+    if outfile.exists() {
+        std::fs::remove_file(outfile)?;
+    }
+
+    // quantize
+    if quantizer.exists() && quantizer.is_file() {
+        println!(
+            "============== Start to quantize {} ...",
+            model.file_name().unwrap().to_str().unwrap()
+        );
+
+        let start = Instant::now();
+        let output = Command::new(quantizer.as_os_str())
+            .arg(model)
+            .arg(outfile)
+            .arg(quant_info)
+            .output()?;
+        let elapsed = Instant::now() - start;
+        println!("The quantization took {:?} seconds.", elapsed.as_secs());
+        println!("output: {:?}", output);
+    } else {
+        panic!("Not found quantizer");
     }
 
     Ok(())
