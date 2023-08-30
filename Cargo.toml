@@ -1,2 +1,3 @@
 [workspace]
 members = ["ggml-converter-service", "test-consumer"]
+resolver = "2"
