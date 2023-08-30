@@ -115,12 +115,62 @@ async fn query(Query(params): Query<HashMap<String, String>>) -> String {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ModelInfo {
-    pub(crate) name: String,
-    pub(crate) quant_info: String,
+    name: ModelType,
+    quant_info: QuantInfo,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum ModelType {
+    Llama2_7b,
+    Llama2Chat7b,
+    Llama2Chinese7b,
+}
+impl From<ModelType> for String {
+    fn from(model_type: ModelType) -> Self {
+        match model_type {
+            ModelType::Llama2_7b => "meta-llama/Llama-2-7b-hf".to_string(),
+            ModelType::Llama2Chat7b => "meta-llama/Llama-2-7b-chat-hf".to_string(),
+            ModelType::Llama2Chinese7b => "LinkSoul/Chinese-Llama-2-7b".to_string(),
+        }
+    }
+}
+impl std::fmt::Display for ModelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let model_type = match self {
+            ModelType::Llama2_7b => "meta-llama/Llama-2-7b-hf",
+            ModelType::Llama2Chat7b => "meta-llama/Llama-2-7b-chat-hf",
+            ModelType::Llama2Chinese7b => "LinkSoul/Chinese-Llama-2-7b",
+        };
+        write!(f, "{}", model_type)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum QuantInfo {
+    Q4,
+    Q8,
+    F16,
+    F32,
+}
+impl std::fmt::Display for QuantInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quant_info = match self {
+            QuantInfo::Q4 => "q4_0",
+            QuantInfo::Q8 => "q8_0",
+            QuantInfo::F16 => "f16",
+            QuantInfo::F32 => "f32",
+        };
+        write!(f, "{}", quant_info)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ConversionResult {
+    download_url: String,
 }
 
 // json request
-async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
+async fn json_request(Json(model_info): Json<ModelInfo>) -> Json<ConversionResult> {
     println!("{:?}", &model_info);
 
     // download and build llama.cpp
@@ -140,7 +190,11 @@ async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
     }
     let out_filename = format!(
         "{}-ggml.{}",
-        model_info.name.as_str().split('/').collect::<Vec<&str>>()[1],
+        model_info
+            .name
+            .to_string()
+            .split('/')
+            .collect::<Vec<&str>>()[1],
         "bin"
     );
     let outfile = outputs_dir.join(out_filename.as_str());
@@ -155,7 +209,11 @@ async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
     // quantize the ggml model
     let quantized_filename = format!(
         "{}-ggml-{}.{}",
-        model_info.name.as_str().split('/').collect::<Vec<&str>>()[1],
+        model_info
+            .name
+            .to_string()
+            .split('/')
+            .collect::<Vec<&str>>()[1],
         model_info.quant_info,
         "bin"
     );
@@ -163,13 +221,19 @@ async fn json_request(Json(model_info): Json<ModelInfo>) -> String {
     quantize_ggml(
         llama_cpp_dir.as_path(),
         outfile.as_path(),
-        model_info.quant_info.as_str(),
+        model_info.quant_info,
         quantized_outfile.as_path(),
     )
     .await
     .unwrap();
 
-    "download_url".to_string()
+    println!("Done.");
+
+    let res = ConversionResult {
+        download_url: quantized_outfile.to_str().unwrap().to_string(),
+    };
+
+    Json(res)
 }
 
 // From https://github.com/ggerganov/llama.cpp/tags
@@ -246,16 +310,23 @@ async fn download_llama2_models(
         std::fs::create_dir(models_dir.as_path())?;
     }
 
-    let model_repo_dir =
-        models_dir.join(model_info.name.as_str().split('/').collect::<Vec<&str>>()[1]);
+    let model_repo_dir = models_dir.join(
+        model_info
+            .name
+            .to_string()
+            .split('/')
+            .collect::<Vec<&str>>()[1],
+    );
     if model_repo_dir.exists() {
         println!("Model '{}' already exists", model_info.name);
     } else {
         let locked = MODELS.lock().unwrap();
-        let url = locked.get(model_info.name.as_str()).ok_or(format!(
-            "Failed to get the url of the model '{}'",
-            model_info.name
-        ))?;
+        let url = locked
+            .get(model_info.name.to_string().as_str())
+            .ok_or(format!(
+                "Failed to get the url of the model '{}'",
+                model_info.name.to_string()
+            ))?;
 
         println!("Downloading from {url}...");
 
@@ -312,8 +383,11 @@ async fn convert_to_ggml(
             .arg(outfile)
             .output()?;
         let elapsed = Instant::now() - start;
-        println!("The conversion took {:?} seconds.", elapsed.as_secs());
-        println!("output: {:?}", output);
+
+        match output.status.success() {
+            true => println!("The conversion took {:?} seconds.", elapsed.as_secs()),
+            false => println!("Conversion failed!"),
+        }
     } else {
         panic!("Not found converter.py");
     }
@@ -321,10 +395,11 @@ async fn convert_to_ggml(
     Ok(())
 }
 
+/// Quantize the ggml model
 async fn quantize_ggml(
     llama_cpp_dir: &std::path::Path,
     model: &std::path::Path,
-    quant_info: &str,
+    quant_info: QuantInfo,
     outfile: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let quantizer = llama_cpp_dir.join("quantize");
@@ -345,11 +420,14 @@ async fn quantize_ggml(
         let output = Command::new(quantizer.as_os_str())
             .arg(model)
             .arg(outfile)
-            .arg(quant_info)
+            .arg(quant_info.to_string())
             .output()?;
         let elapsed = Instant::now() - start;
-        println!("The quantization took {:?} seconds.", elapsed.as_secs());
-        println!("output: {:?}", output);
+
+        match output.status.success() {
+            true => println!("The quantization took {:?} seconds.", elapsed.as_secs()),
+            false => println!("Quantization failed!"),
+        }
     } else {
         panic!("Not found quantizer");
     }
