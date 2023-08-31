@@ -509,7 +509,7 @@ async fn main() {
         .route("/blog_cn", get(blog_struct_cn))
         .route("/custom_error", get(custom_error))
         .route("/query", get(query))
-        .route("/json", post(json_request));
+        .route("/ggml", post(json_request));
 
     // run it with hyper on localhost:3000
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
