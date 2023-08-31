@@ -428,6 +428,9 @@ async fn quantize_ggml(
             true => println!("The quantization took {:?} seconds.", elapsed.as_secs()),
             false => println!("Quantization failed!"),
         }
+
+        // remove the original ggml model
+        std::fs::remove_file(model)?;
     } else {
         panic!("Not found quantizer");
     }
