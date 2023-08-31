@@ -44,7 +44,7 @@ async fn main() -> Result<(), Error> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post("http://localhost:3000/json")
+        .post("http://localhost:3000/ggml")
         .json(&model_info)
         .send()
         .await?;
